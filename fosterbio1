@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+# BioinformaticsPro - Core Integration Module
+# This module binds together the proteomics, transcriptomics, genomics modules
+# With additional support for phylogenetics and systems biology
+
+import os
+import sys
+import logging
+import yaml
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Union, Any
+from dataclasses import dataclass
+import multiprocessing as mp
+import argparse
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('BioinformaticsPro')
+
+# Import the core modules
+# from proteomics_module import ProteomicsModule
+# from transcriptomics_module import TranscriptomicsModule
+# from genomics_module import GenomicsModule
+
+# Phylogenetic Tree Module
+from Bio import Phylo, AlignIO, SeqIO
+from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
+from Bio.Phylo.Consensus import bootstrap_consensus
+from io import StringIO
+import subprocess
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import re
+import requests
+import networkx as nx
+
+# BioML Module
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from abc import ABC, abstractmethod
+
+# --- BioML Module Code ---
+class MultiModalBioDataset(Dataset):
+    """Dataset class for handling multimodal biological data"""
+    
+    def __init__(self, 
+                 genomic_data: Optional[np.ndarray] = None,
+                 transcriptomic_data: Optional[np.ndarray] = None,
+                 proteomic_data: Optional[np.ndarray] = None,
+                 structural_data: Optional[np.ndarray] = None,
+                 metadata: Optional[pd.DataFrame] = None,
+                 labels: Optional[np.ndarray] = None,
+                 transform: Optional[callable] = None):
+        """
+        Initialize the multimodal biological dataset
+        
+        Args:
+            genomic_data: Array of genomic features
+            transcriptomic_data: Array of transcriptomic features
+            proteomic_data: Array of proteomic features
+            structural_data: Array of structural features
+            metadata: DataFrame containing sample metadata
+            labels: Array of target labels
+            transform: Optional transform to apply to the data
+        """
+        self.genomic_data = genomic_data
+        self.transcriptomic_data = transcriptomic_data
+        self.proteomic_data = proteomic_data
+        self.structural_data = structural_data
+        self.metadata = metadata
+        self.labels = labels
+        self.transform = transform
+        
+        # Validate data
+        self._validate_data()
+        
+        # Set sample count
+        if self.genomic_data is not None:
+            self.n_samples = len(self.genomic_data)
+        elif self.transcriptomic_data is not None:
+            self.n_samples = len(self.transcriptomic_data)
+        elif self.proteomic_data is not None:
+            self.n_samples = len(self.proteomic_data)
+        elif self.structural_data is not None:
+            self.n_samples = len(self.structural_data)
+        else:
+            raise ValueError("At least one data modality must be provided")
+            
+        logger.info(f"Dataset initialized with {self.n_samples} samples")
+        
+    def _validate_data(self):
+        """Validate that all provided data has the same number of samples"""
+        sample_counts = []
+        
+        if self.genomic_data is not None:
+            sample_counts.append(len(self.genomic_data))
+        if self.transcriptomic_data is not None:
+            sample_counts.append(len(self.transcriptomic_data))
+        if self.proteomic_data is not None:
+            sample_counts.append(len(self.proteomic_data))
+        if self.structural_data is not None:
+            sample_counts.append(len(self.structural_data))
+        if self.labels is not None:
+            sample_counts.append(len(self.labels))
+        
+        if len(set(sample_counts)) > 1:
+            raise ValueError("All data modalities must have the same number of samples")
+    
+    def __len__(self):
+        return self.n_samples
+    
+    def __getitem__(self, idx):
+        """Get a sample from the dataset"""
+        sample = {}
+        
+        if self.genomic_data is not None:
+            sample['genomic'] = torch.tensor(self.genomic_data[idx], dtype=torch.float32)
+        
+        if self.transcriptomic_data is not None:
+            sample['transcriptomic'] = torch.tensor(self.transcriptomic_data[idx], dtype=torch.float32)
+        
+        if self.proteomic_data is not None:
+            sample['proteomic'] = torch.tensor(self.proteomic_data[idx], dtype=torch.float32)
+        
+        if self.structural_data is not None:
+            sample['structural'] = torch.tensor(self.structural_data[idx], dtype=torch.float32)
+        
+        if self.labels is not None:
+            sample['label'] = torch.tensor(self.labels[idx], dtype=torch.float32)
+        
+        if self.transform:
+            sample = self.transform(sample)
+            
+        return sample
+
+
+class AttentionLayer(nn.Module):
+    """Attention mechanism for weighting features"""
+    
+    def __init__(self, input_dim: int, attention_dim: int = 64):
+        """
+        Initialize the attention layer
+        
+        Args:
+            input_dim: Dimension of input features
+            attention_dim: Dimension of attention mechanism
+        """
+        super(AttentionLayer, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, attention_dim),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 1)
+        )
+    
+    def forward(self, x):
+        """
+        Apply attention mechanism to input features
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, input_dim)
+            
+        Returns:
+            weighted_x: Weighted features
+            attention_weights: Attention weights for interpretability
+        """
+        batch_size, seq_len, _ = x.size()
+        
+        # Calculate attention scores
+        attention_scores = self.attention(x).squeeze(-1)  # (batch_size, seq_len)
+        
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(attention_scores, dim=1)  # (batch_size, seq_len)
+        
+        # Apply attention weights to input
+        weighted_x = torch.bmm(attention_weights.unsqueeze(1), x).squeeze(1)  # (batch_size, input_dim)
+        
+        return weighted_x, attention_weights
+
+
+class ModalityEncoder(nn.Module, ABC):
+    """Base class for encoding specific biological data modalities"""
+    
+    @abstractmethod
+    def forward(self, x):
+        pass
+    
+    @property
+    @abstractmethod
+    def output_dim(self):
+        pass
+
+
+class GenomicEncoder(ModalityEncoder):
+    """Encoder for genomic data"""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int] = [512, 256]):
+        """
+        Initialize the genomic encoder
+        
+        Args:
+            input_dim: Dimension of input genomic features
+            hidden_dims: List of hidden layer dimensions
+        """
+        super(GenomicEncoder, self).__init__()
+        
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            prev_dim = hidden_dim
+            
+        self.encoder = nn.Sequential(*layers)
+        self.attention = AttentionLayer(hidden_dims[-1])
+        self._output_dim = hidden_dims[-1]
+        
+    def forward(self, x):
+        """
+        Encode genomic data
+        
+        Args:
+            x: Input genomic data of shape (batch_size, input_dim)
+            
+        Returns:
+            encoded: Encoded genomic features
+            attention_weights: Attention weights for interpretability
+        """
+        batch_size = x.size(0)
+        encoded = self.encoder(x)
+        
+        # Reshape for attention
+        encoded = encoded.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        
+        # Apply attention
+        encoded, attention_weights = self.attention(encoded)
+        
+        return encoded, attention_weights
+    
+    @property
+    def output_dim(self):
+        return self._output_dim
+
+
+class TranscriptomicEncoder(ModalityEncoder):
+    """Encoder for transcriptomic data"""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int] = [1024, 512, 256]):
+        """
+        Initialize the transcriptomic encoder
+        
+        Args:
+            input_dim: Dimension of input transcriptomic features
+            hidden_dims: List of hidden layer dimensions
+        """
+        super(TranscriptomicEncoder, self).__init__()
+        
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            prev_dim = hidden_dim
+            
+        self.encoder = nn.Sequential(*layers)
+        self.attention = AttentionLayer(hidden_dims[-1])
+        self._output_dim = hidden_dims[-1]
+        
+    def forward(self, x):
+        """
+        Encode transcriptomic data
+        
+        Args:
+            x: Input transcriptomic data of shape (batch_size, input_dim)
+            
+        Returns:
+            encoded: Encoded transcriptomic features
+            attention_weights: Attention weights for interpretability
+        """
+        batch_size = x.size(0)
+        encoded = self.encoder(x)
+        
+        # Reshape for attention
+        encoded = encoded.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        
+        # Apply attention
+        encoded, attention_weights = self.attention(encoded)
+        
+        return encoded, attention_weights
+    
+    @property
+    def output_dim(self):
+        return self._output_dim
+
+
+class ProteomicEncoder(ModalityEncoder):
+    """Encoder for proteomic data"""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int] = [512, 256]):
+        """
+        Initialize the proteomic encoder
+        
+        Args:
+            input_dim: Dimension of input proteomic features
+            hidden_dims: List of hidden layer dimensions
+        """
+        super(ProteomicEncoder, self).__init__()
+        
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            prev_dim = hidden_dim
+            
+        self.encoder = nn.Sequential(*layers)
+        self.attention = AttentionLayer(hidden_dims[-1])
+        self._output_dim = hidden_dims[-1]
+        
+    def forward(self, x):
+        """
+        Encode proteomic data
+        
+        Args:
+            x: Input proteomic data of shape (batch_size, input_dim)
+            
+        Returns:
+            encoded: Encoded proteomic features
+            attention_weights: Attention weights for interpretability
+        """
+        batch_size = x.size(0)
+        encoded = self.encoder(x)
+        
+        # Reshape for attention
+        encoded = encoded.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        
+        # Apply attention
+        encoded, attention_weights = self.attention(encoded)
+        
+        return encoded, attention_weights
+    
+    @property
+    def output_dim(self):
+        return self._output_dim
+
+
+class StructuralEncoder(ModalityEncoder):
+    """Encoder for structural data"""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int] = [512, 256]):
+        """
+        Initialize the structural encoder
+        
+        Args:
+            input_dim: Dimension of input structural features
+            hidden_dims: List of hidden layer dimensions
+        """
+        super(StructuralEncoder, self).__init__()
+        
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            prev_dim = hidden_dim
+            
+        self.encoder = nn.Sequential(*layers)
+        self.attention = AttentionLayer(hidden_dims[-1])
+        self._output_dim = hidden_dims[-1]
+        
+    def forward(self, x):
+        """
+        Encode structural data
+        
+        Args:
+            x: Input structural data of shape (batch_size, input_dim)
+            
+        Returns:
+            encoded: Encoded structural features
+            attention_weights: Attention weights for interpretability
+        """
+        batch_size = x.size(0)
+        encoded = self.encoder(x)
+        
+        # Reshape for attention
+        encoded = encoded.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        
+        # Apply attention
+        encoded, attention_weights = self.attention(encoded)
+        
+        return encoded, attention_weights
+    
+    @property
+    def output_dim(self):
+        return self._output_dim
+
+
+class MultiModalFusion(nn.Module):
+    """Module for fusing different modality encodings"""
+    
+    def __init__(self, 
+                 input_dims: Dict[str, int],
+                 hidden_dim: int = 256,
+                 dropout_rate: float = 0.5):
+        """
+        Initialize the multimodal fusion module
+        
+        Args:
+            input_dims: Dictionary mapping modality names to their encoded dimensions
+            hidden_dim: Dimension of the hidden fusion layer
+            dropout_rate: Dropout rate for regularization
+        """
+        super(MultiModalFusion, self).__init__()
+        
+        self.modalities = list(input_dims.keys())
+        self.input_dims = input_dims
+        
+        # Create projection layers for each modality
+        self.projections = nn.ModuleDict({
+            modality: nn.Linear(dim, hidden_dim)
+            for modality, dim in input_dims.items()
+        })
+        
+        # Create attention layer for modality fusion
+        total_dim = hidden_dim * len(input_dims)
+        self.attention = nn.Sequential(
+            nn.Linear(total_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, len(input_dims))
+        )
+        
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.Dropout(dropout_rate)
+        )
+        
+        self.output_dim = hidden_dim
+        
+    def forward(self, modality_outputs: Dict[str, torch.Tensor]):
+        """
+        Fuse multiple modality encodings
+        
+        Args:
+            modality_outputs: Dictionary mapping modality names to their encoded outputs
+            
+        Returns:
+            fused: Fused multimodal representation
+            modality_weights: Attention weights for each modality
+        """
+        # Project each modality to the same dimension
+        projected = {}
+        for modality in self.modalities:
+            if modality in modality_outputs:
+                projected[modality] = self.projections[modality](modality_outputs[modality])
+            
+        # Concatenate projected modalities
+        concat_features = torch.cat([projected[modality] for modality in self.modalities 
+                                     if modality in modality_outputs], dim=1)
+        
+        # Get attention weights for each modality
+        attention_logits = self.attention(concat_features)
+        modality_weights = F.softmax(attention_logits, dim=1)
+        
+        # Apply weighted sum of modalities
+        fused = torch.zeros_like(list(projected.values())[0])
+        for i, modality in enumerate(self.modalities):
+            if modality in modality_outputs:
+                fused += modality_weights[:, i].unsqueeze(1) * projected[modality]
+        
+        # Apply final fusion layer
+        fused = self.fusion(fused)
+        
+        return fused, modality_weights
+
+# --- End of BioML Module Code ---
+
+# --- Systems Biology Module Code --- 
+class DatabaseConnector:
+    """
+    Handles connections and queries to major biological databases
+    with automatic format parsing and error handling.
+    """
+    
+    # API endpoints for major databases
+    ENDPOINTS = {
+        "kegg": "https://rest.kegg.jp",
+        "reactome": "https://reactome.org/ContentService",
+        "string": "https://string-db.org/api",
+        "uniprot": "https://rest.uniprot.org",
+        "biogrid": "https://webservice.thebiogrid.org",
+        "ensembl": "https://rest.ensembl.org",
+        "ncbi": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
+        "intact": "https://www.ebi.ac.uk/intact/ws",
+        "interpro": "https://www.ebi.ac.uk/interpro/api",
+        "pdb": "https://data.rcsb.org/rest/v1"
+    }
+    
+    # Default timeouts and retry settings
+    DEFAULT_TIMEOUT = 30
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1
+    
+    def __init__(self, api_keys: Dict[str, str] = None, cache_dir: str = None):
+        """
+        Initialize database connector with optional API keys
+        
+        Args:
+            api_keys: Dictionary mapping database names to API keys
+            cache_dir: Directory to cache responses
+        """
+        self.api_keys = api_keys or {}
+        self.cache_dir = cache_dir
+        self.session = requests.Session()
+        
+        # Initialize cache if directory specified
+        if cache_dir:
+            import os
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir)
+            
+            # Initialize simple cache
+            self.cache = {}
+    
+    def query(self, database: str, endpoint: str, params: Dict = None, 
+              method: str = "GET", data: Dict = None, 
+              parse_format: str = "json") -> Union[Dict, pd.DataFrame, nx.Graph, str]:
+        """
+        Query a biological database with error handling and parsing
+        
+        Args:
+            database: Name of database (must be in ENDPOINTS)
+            endpoint: API endpoint path
+            params: URL parameters
+            method: HTTP method (GET, POST)
+            data: Data for POST requests
+            parse_format: Format to parse response into (json, df, graph, text)
+            
+        Returns:
+            Parsed response data in requested format
+        """
+        if database not in self.ENDPOINTS:
+            raise ValueError(f"Unsupported database: {database}")
+        
+        # Construct full URL
+        base_url = self.ENDPOINTS[database]
+        url = f"{base_url}/{endpoint.lstrip('/')}"
+        
+        # Add API key if available
+        req_params = params or {}
+        if database in self.api_keys:
+            req_params['apiKey'] = self.api_keys[database]
+        
+        # Check cache
+        cache_key = f"{url}_{json.dumps(req_params)}_{method}"
+        if self.cache_dir and cache_key in self.cache:
+            logger.info(f"Cache hit for {database} query")
+            return self.cache[cache_key]
+        
+        # Make request with retries
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                if method.upper() == "GET":
+                    response = self.session.get(url, params=req_params, 
+                                              timeout=self.DEFAULT_TIMEOUT)
+                else:
+                    response = self.session.post(url, params=req_params, 
+                                               json=data, timeout=self.DEFAULT_TIMEOUT)
+                
+                response.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Request failed (attempt {attempt+1}): {str(e)}")
+                if attempt == self.MAX_RETRIES - 1:
+                    raise
+                import time
+                time.sleep(self.RETRY_DELAY * (attempt + 1))
+        
+        # Parse response based on requested format
+        result = self._parse_response(response, parse_format, database)
+        
+        # Cache result if caching enabled
+        if self.cache_dir:
+            self.cache[cache_key] = result
+        
+        return result
+    
+    def _parse_response(self, response, format_type, database):
+        """Parse response into requested format"""
+        try:
+            if format_type == "json":
+                return response.json()
+            elif format_type == "df":
+                if database == "kegg" and "html" not in response.headers.get('Content-Type', ''):
+                    # Handle KEGG's custom tab-delimited format
+                    return pd.read_csv(StringIO(response.text), sep="\t")
+                else:
+                    # Try JSON first, then CSV
+                    try:
+                        data = response.json()
+                        if isinstance(data, list):
+                            return pd.DataFrame(data)
+                        elif isinstance(data, dict):
+                            if "results" in data and isinstance(data["results"], list):
+                                return pd.DataFrame(data["results"])
+                            else:
+                                return pd.DataFrame([data])
+                    except:
+                        return pd.read_csv(StringIO(response.text))
+            elif format_type == "graph":
+                data = response.json()
+                G = nx.DiGraph()
+                
+                # Handle different network formats
+                if database == "string":
+                    for interaction in data.get("interactions", []):
+                        G.add_edge(interaction["stringId_A"], interaction["stringId_B"], 
+                                 score=interaction.get("score", 0))
+                elif database in ["reactome", "kegg"]:
+                    # Simplistic conversion - would need customization for actual API responses
+                    for pathway in data:
+                        for i, entity in enumerate(pathway.get("entities", [])):
+                            if i > 0:
+                                G.add_edge(pathway["entities"][i-1]["id"], entity["id"])
+                else:
+                    # Generic handler for potential interactions
+                    if isinstance(data, list):
+                        for item in data:
+                            if "source" in item and "target" in item:
+                                G.add_edge(item["source"], item["target"])
+                
+                return G
+            else:
+                return response.text
+        except Exception as e:
+            logger.error(f"Error parsing response: {str(e)}")
+            return response.text
+
+    def batch_query(self, queries: List[Dict], max_workers: int = 5) -> List:
+        """
+        Execute multiple queries in parallel
+        
+        Args:
+            queries: List of query parameter dictionaries
+            max_workers: Maximum number of parallel workers
+            
+        Returns:
+            List of query results in the same order
+        """
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for q in queries:
+                futures.append(
+                    executor.submit(
+                        self.query,
+                        q.get("database"),
+                        q.get("endpoint"),
+                        q.get("params"),
+                        q.get("method", "GET"),
+                        q.get("data"),
+                        q.get("parse_format", "json")
+                    )
+                )
+            
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    results.append({"error": str(e)})
+        
+        return results
+
+
+class PathwayAnalysis:
+    """
+    Tools for biological pathway analysis including
+    enrichment, visualization, and cross-database integration.
+    """
+    
+    def __init__(self, db_connector: DatabaseConnector):
+        """
+        Initialize pathway analysis with database connector
+        
+        Args:
+            db_connector: Initialized DatabaseConnector instance
+        """
+        self.db = db_connector
+        
+        # Common organism identifiers
+        self.organisms = {
+            "human": {"kegg": "hsa", "reactome": "48887", "string": "9606"},
+            "mouse": {"kegg": "mmu", "reactome": "48892", "string": "10090"},
+            "rat": {"kegg": "rno", "reactome": "48895", "string": "10116"},
+            "yeast": {"kegg": "sce", "reactome": "4932", "string": "4932"},
+            "e_coli": {"kegg": "eco", "reactome": "83333", "string": "511145"}
+        }
+    
+    def gene_set_enrichment(self, genes: List[str], organism: str = "human", 
+                           databases: List[str] = None, p_value_cutoff: float = 0.05,
+                           background_genes: List[str] = None) -> pd.DataFrame:
+        """
+        Perform gene set enrichment analysis across multiple databases
+        
+        Args:
+            genes: List of gene identifiers
+            organism: Organism name (must be in self.organisms)
+            databases: List of databases to query (default: all available)
+            p_value_cutoff: P-value cutoff for significance
+            background_genes: Optional background gene set
+            
+        Returns:
+            DataFrame with enrichment results, sorted by significance
+        """
+        if organism not in self.organisms:
+            raise ValueError(f"Unsupported organism: {organism}. Supported: {list(self.organisms.keys())}")
+        
+        databases = databases or ["kegg", "reactome"]
+        results = []
+        
+        for db in databases:
+            # Get organism-specific ID
+            org_id = self.organisms[organism].get(db)
+            if not org_id:
+                logger.warning(f"No organism ID for {organism} in {db}, skipping")
+                continue
+                
+            try:
+                if db == "kegg":
+                    # Query KEGG for enrichment
+                    params = {
+                        "org": org_id
+                    }
+                    pathways = self.db.query("kegg", "list/pathway/" + org_id, 
+                                           parse_format="df")
+                    
+                    # Convert gene list to KEGG IDs if needed
+                    if not genes[0].startswith(org_id):
+                        gene_mapping = self._convert_to_kegg_ids(genes, org_id)
+                        kegg_genes = list(gene_mapping.values())
+                    else:
+                        kegg_genes = genes
+                    
+                    # Calculate enrichment manually
+                    enriched = self._calculate_kegg_enrichment(
+                        kegg_genes, pathways, org_id, p_value_cutoff, background_genes
+                    )
+                    
+                    # Add database source column
+                    enriched["Database"] = "KEGG"
+                    results.append(enriched)
+                    
+                elif db == "reactome":
+                    # Use Reactome Analysis Service
+                    # Convert genes to appropriate format if needed
+                    analysis_result = self.db.query(
+                        "reactome", 
+                        "analysis/identifier",
+                        method="POST",
+                        params={"species": org_id},
+                        data={"identifiers": genes, "interactors": False},
+                        parse_format="json"
+                    )
+                    
+                    if "pathwaysFound" in analysis_result:
+                        # Extract pathway data
+                        token = analysis_result.get("summary", {}).get("token")
+                        if token:
+                            pathway_data = self.db.query(
+                                "reactome",
+                                f"analysis/token/{token}/pathways",
+                                params={"pValue": p_value_cutoff},
+                                parse_format="json"
+                            )
+                            
+                            # Convert to DataFrame
+                            if pathway_data:
+                                react_df = pd.DataFrame(pathway_data)
+                                if not react_df.empty:
+                                    react_df = react_df.rename(columns={
+                                        "stId": "Pathway_ID",
+                                        "name": "Pathway_Name",
+                                        "entities": "Genes_Found",
+                                        "pValue": "P_Value"
+                                    })
+                                    
+                                    react_df["Database"] = "Reactome"
+                                    
+                                    # Extract key columns
+                                    cols_to_keep = ["Pathway_ID", "Pathway_Name", "Genes_Found", 
+                                                  "P_Value", "FDR", "Database"]
+                                    react_df = react_df[[c for c in cols_to_keep if c in react_df.columns]]
+                                    
+                                    results.append(react_df)
+            except Exception as e:
+                logger.error(f"Error during enrichment analysis with {db}: {str(e)}")
+        
+        # Combine results
+        if results:
+            combined = pd.concat(results, ignore_index=True)
+            return combined.sort_values("P_Value")
+        else:
+            return pd.DataFrame(columns=["Pathway_ID", "Pathway_Name", "Genes_Found", 
+                                       "P_Value", "FDR", "Database"])
+    
+    def _convert_to_kegg_ids(self, genes, org_id):
+        """Convert gene IDs to KEGG format"""
+        # Detect input format
+        gene_format = self._detect_gene_id_format(genes[0])
+        
+        # Query conversion endpoint
+        conversion_result = self.db.query(
+            "kegg",
+            f"conv/{org_id}/{gene_format}",
+            parse_format="text"
+        )
+        
+        # Parse conversion results
+        mapping = {}
+        for line in conversion_result.strip().split("\n"):
+            if line:
+                parts = line.split("\t")
+                if len(parts) == 2:
+                    source, target = parts
+                    source_id = source.split(":")[-1]
+                    mapping[source_id] = target
+        
+        return mapping
+    
+    def _detect_gene_id_format(self, gene_id):
+        """Detect the format of gene identifiers"""
+        if gene_id.startswith("ENS"):
+            return "ensembl"
+        elif re.match(r"^[A-Z0-9]+$", gene_id) and len(gene_id) <= 10:
+            return "uniprot"
+        elif re.match(r"^[0-9]+$", gene_id):
+            return "ncbi-geneid"
+        else:
+            return "ncbi-proteinid"  # default
+    
+    def _calculate_kegg_enrichment(self, genes, pathways, org_id, p_cutoff, background=None):
+        """Calculate enrichment p-values for KEGG pathways"""
+        from scipy import stats
+        import numpy as np
+        
+        # Get all genes in organism as background if not provided
+        if background is None:
+            genes_result = self.db.query(
+                "kegg",
+                f"list/{org_id}",
+                parse_format="text"
+            )
+            background = [line.split()[0] for line in genes_result.strip().split("\n")]
+        
+        # Get gene sets for each pathway
+        pathway_genes = {}
+        for _, row in pathways.iterrows():
+            pathway_id = row["# Pathway"]
+            genes_in_pathway = self.db.query(
+                "kegg",
+                f"link/gene/{pathway_id}",
+                parse_format="text"
+            )
+            pathway_genes[pathway_id] = [line.split()[-1] for line in genes_in_pathway.strip().split("\n")]
+        
+        # Perform enrichment analysis for each pathway
+        enrichment_results = []
+        for pathway_id, pathway_gene_set in pathway_genes.items():
+            # Find overlap between input genes and pathway genes
+            overlap = set(genes).intersection(pathway_gene_set)
+            
+            # Calculate contingency table
+            in_pathway_in_genes = len(overlap)
+            in_pathway_not_in_genes = len(pathway_gene_set) - in_pathway_in_genes
+            not_in_pathway_in_genes = len(genes) - in_pathway_in_genes
+            not_in_pathway_not_in_genes = len(background) - (in_pathway_in_genes + 
+                                                            in_pathway_not_in_genes + 
+                                                            not_in_pathway_in_genes)
+            
+            contingency_table = np.array([
+                [in_pathway_in_genes, in_pathway_not_in_genes],
+                [not_in_pathway_in_genes, not_in_pathway_not_in_genes]
+            ])
+            
+            # Calculate Fisher's exact test
+            odds_ratio, p_value
